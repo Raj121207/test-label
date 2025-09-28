@@ -1577,7 +1577,7 @@ class ShippinglabelController extends Controller
                 'noFulfillments' => true,
                 'unfulfilledOrders' => $unfulfilledOrders,
             ])->with('activePickup', $pickup_account)
-              ->with('error', 'Cannot create labels: Some orders are not fulfilled.');
+            ->with('error', 'Cannot create labels: Some orders are not fulfilled.');
         }
 
         // Proceed with label generation only if all orders are fulfilled
@@ -1596,8 +1596,6 @@ class ShippinglabelController extends Controller
         $pickup_date = null;
         $consolidated_label = "Y";
         $product_code = $configuration['product_code'] ?? "PDO";
-        $cash_on_delivery = null;
-        $shipment_value_protection = null;
         $multi_pieces_shipment = "false";
         $return_mode = "01";
         
@@ -1631,7 +1629,8 @@ class ShippinglabelController extends Controller
             'messageDateTime' => date('c'),
             'accessToken' => $access_token,
             'messageVersion' => '1.4',
-            'messageLanguage' => 'en'
+            'messageLanguage' => 'en',
+            'messageSource' => 'Shopify'
         ];
 
         $bd = [
@@ -1669,7 +1668,7 @@ class ShippinglabelController extends Controller
                 $order_data = $this->getOrderDetails($order_id);
                 $getOrderRowData = $this->getOrderRowData($order_id)['order'];
                 $order_edge = $order_data['data']['order'];
-                $weight = $this->calculateVariantWeights($edge['lineItems']['edges']);
+                $weight = $this->calculateVariantWeights($order_edge['lineItems']['edges']);
                 $global_order_id = $order_edge['name'];
 
                 if (!isset($pickup_account) || empty($pickup_account)) {
@@ -1713,6 +1712,14 @@ class ShippinglabelController extends Controller
                 $package_description = $order_info['products'][0]['name'] ?? 'Order ' . $order_info['name'];
                 $remarks = $order_info['products'][0]['name'] ?? 'Order ' . $order_info['name'];
 
+                $cod_value = null;
+                $payment_gateway = $getOrderRowData['payment_gateway_names'][0] ?? '';
+                if (in_array('COD', $selected_services) || $payment_gateway === 'Cash on Delivery (COD)') {
+                    $cod_value = (float)($getOrderRowData['total_price'] ?? 0);
+                }
+
+                $insurance_value = in_array('INS', $selected_services) ? (float)($getOrderRowData['total_price'] ?? 0) : null;
+
                 $shipment_item = [
                     'consigneeAddress' => [
                         'companyName' => $order_info['shippingAddress']['company'] ?? $order_info['billingAddress']['company'] ?? null,
@@ -1738,21 +1745,21 @@ class ShippinglabelController extends Controller
                     'totalWeight' => (int)($order_info['weight'] ?? 0),
                     'totalWeightUOM' => 'G',
                     'productCode' => $product_code,
-                    'codValue' => ($getOrderRowData['payment_gateway_names'][0] ?? '') === 'Cash on Delivery (COD)' 
-                        ? (float)$getOrderRowData['total_price'] 
-                        : null,
-                    'insuranceValue' => !empty($shipment_value_protection) ? floatval($shipment_value_protection) : null,
+                    'codValue' => $cod_value,
+                    'insuranceValue' => $insurance_value,
                     'currency' => $currency,
                     'remarks' => $remarks,
                     'isMult' => $multi_pieces_shipment
                 ];
 
-                if (!empty($selected_services)) {
-                    $value_added_services = [];
-                    foreach ($selected_services as $service) {
-                        $value_added_services[] = ['vasCode' => $service];
+                $vas_array = [];
+                foreach ($selected_services as $service) {
+                    if (in_array($service, ['OBOX', 'PPOD'])) {
+                        $vas_array[] = ['vasCode' => $service];
                     }
-                    $shipment_item['valueAddedServices'] = ['valueAddedService' => $value_added_services];
+                }
+                if (!empty($vas_array)) {
+                    $shipment_item['valueAddedServices'] = ['valueAddedService' => $vas_array];
                 }
 
                 $bd['shipmentItems'] = [$shipment_item];
@@ -1768,34 +1775,102 @@ class ShippinglabelController extends Controller
 
                     if ($response_status['message'] === 'SUCCESS') {
                         $shipment_id = $label['shipmentID'];
-                        $delivery_confirmation_no = $label['deliveryConfirmationNo'];
-                        $content = $label['content'];
+                        $delivery_confirmation_no = $label['deliveryConfirmationNo'] ?? '';
+                        $content = $label['content'] ?? '';
+                        $ppod_content = $label['ppodLabel'] ?? '';
+                        $pieces = $label['pieces'] ?? [];
 
-                        if (!empty($label['pieces']) && !empty($label['pieces'][0])) {
-                            $delivery_confirmation_no = $label['pieces'][0]['deliveryConfirmationNo'];
-                            $content = $label['pieces'][0]['content'];
-                        }
-
-                        $label_format = $configuration['label_format'] ?? 'PNG';
+                        $label_format = isset($configuration['label_format']) && !empty($configuration['label_format']) ? $configuration['label_format'] : 'PNG';
                         $label_format_ext = strtolower($label_format);
-                        $image = $shipment_id . "." . $label_format_ext;
 
-                        if (in_array($label_format, ['PNG', 'ZPL'])) {
-                            Storage::disk('local')->put($this->labels_dir . '/' . $image, base64_decode($content));
-                        } elseif ($label_format === 'PDF') {
-                            $pdf_decoded = base64_decode($content);
-                            $pdf_name = Storage::disk('local')->path($this->labels_dir . '/' . $image);
-                            $pdf = fopen($pdf_name, 'w');
-                            fwrite($pdf, $pdf_decoded);
-                            fclose($pdf);
+                        $generated_labels = [];
+                        if (!empty($pieces)) {
+                            foreach ($pieces as $piece) {
+                                $image = $shipment_id . "-" . $piece['shipmentPieceID'] . "." . $label_format_ext;
+                                if ($label_format == "PNG" || $label_format == "ZPL") {
+                                    Storage::disk('local')->put($this->labels_dir . '/' . $image, base64_decode($piece['content']));
+                                } elseif ($label_format == "PDF") {
+                                    $pdf_decoded = base64_decode($piece['content']);
+                                    $pdf_name = Storage::disk('local')->path($this->labels_dir . '/' . $image);
+                                    $pdf = fopen($pdf_name, 'w');
+                                    fwrite($pdf, $pdf_decoded);
+                                    fclose($pdf);
+                                }
+                                $generated_labels[] = [
+                                    "label" => $image,
+                                    "delivery_confirmation_no" => $piece['deliveryConfirmationNo'],
+                                    "extension" => $label_format_ext
+                                ];
+
+                                $label_path = Storage::disk('local')->path($this->labels_dir . '/' . $image);
+                                if (file_exists($label_path)) {
+                                    $labels[$image] = ["file" => $label_path, "name" => $image];
+                                }
+                            }
+
+                            if (isset($pieces[0]['ppodLabel']) && !empty($pieces[0]['ppodLabel'])) {
+                                $ppod_image = $shipment_id . "-PPOD." . $label_format_ext;
+                                $ppod_content = $pieces[0]['ppodLabel'];
+                                if ($label_format == "PNG" || $label_format == "ZPL") {
+                                    Storage::disk('local')->put($this->labels_dir . '/' . $ppod_image, base64_decode($ppod_content));
+                                } elseif ($label_format == "PDF") {
+                                    $ppod_pdf_decoded = base64_decode($ppod_content);
+                                    $ppod_pdf_name = Storage::disk('local')->path($this->labels_dir . '/' . $ppod_image);
+                                    $ppod_pdf = fopen($ppod_pdf_name, 'w');
+                                    fwrite($ppod_pdf, $ppod_pdf_decoded);
+                                    fclose($ppod_pdf);
+                                }
+                                $generated_labels[0]['ppod'] = $ppod_image;
+
+                                $ppod_path = Storage::disk('local')->path($this->labels_dir . '/' . $ppod_image);
+                                if (file_exists($ppod_path)) {
+                                    $labels[$ppod_image] = ["file" => $ppod_path, "name" => $ppod_image];
+                                }
+                            }
+                        } else {
+                            $image = $shipment_id . "." . $label_format_ext;
+                            if ($label_format == "PNG" || $label_format == "ZPL") {
+                                Storage::disk('local')->put($this->labels_dir . '/' . $image, base64_decode($content));
+                            } elseif ($label_format == "PDF") {
+                                $pdf_decoded = base64_decode($content);
+                                $pdf_name = Storage::disk('local')->path($this->labels_dir . '/' . $image);
+                                $pdf = fopen($pdf_name, 'w');
+                                fwrite($pdf, $pdf_decoded);
+                                fclose($pdf);
+                            }
+                            $generated_labels[] = [
+                                "label" => $image,
+                                "ppod" => '',
+                                "delivery_confirmation_no" => $delivery_confirmation_no,
+                                "extension" => $label_format_ext
+                            ];
+
+                            $label_path = Storage::disk('local')->path($this->labels_dir . '/' . $image);
+                            if (file_exists($label_path)) {
+                                $labels[$image] = ["file" => $label_path, "name" => $image];
+                            }
+
+                            if (!empty($ppod_content)) {
+                                $ppod_image = $shipment_id . "-PPOD." . $label_format_ext;
+                                if ($label_format == "PNG" || $label_format == "ZPL") {
+                                    Storage::disk('local')->put($this->labels_dir . '/' . $ppod_image, base64_decode($ppod_content));
+                                } elseif ($label_format == "PDF") {
+                                    $ppod_pdf_decoded = base64_decode($ppod_content);
+                                    $ppod_pdf_name = Storage::disk('local')->path($this->labels_dir . '/' . $ppod_image);
+                                    $ppod_pdf = fopen($ppod_pdf_name, 'w');
+                                    fwrite($ppod_pdf, $ppod_pdf_decoded);
+                                    fclose($ppod_pdf);
+                                }
+                                $generated_labels[0]['ppod'] = $ppod_image;
+
+                                $ppod_path = Storage::disk('local')->path($this->labels_dir . '/' . $ppod_image);
+                                if (file_exists($ppod_path)) {
+                                    $labels[$ppod_image] = ["file" => $ppod_path, "name" => $ppod_image];
+                                }
+                            }
                         }
 
-                        $generated_labels = [[
-                            "label" => $image,
-                            "ppod" => '',
-                            "delivery_confirmation_no" => $delivery_confirmation_no,
-                            "extension" => $label_format_ext
-                        ]];
+                        $content_for_model = empty($pieces) ? $content : "";
 
                         Storage::disk('local')->put($this->label_json_dir . "/" . $shipment_id . ".json", json_encode($request_data));
 
@@ -1805,8 +1880,8 @@ class ShippinglabelController extends Controller
                         ])->update([
                             'shipment_id' => $shipment_id,
                             'delivery_confirmation_no' => $delivery_confirmation_no,
-                            'content' => $content,
-                            'image' => $image,
+                            'content' => $content_for_model,
+                            'image' => empty($pieces) ? $image : '',
                             'generated_labels' => json_encode($generated_labels),
                             'updated_at' => $current_datetime
                         ]);
@@ -1818,21 +1893,15 @@ class ShippinglabelController extends Controller
                             $newLabel->order_name = $order_info['name'];
                             $newLabel->shipment_id = $shipment_id;
                             $newLabel->delivery_confirmation_no = $delivery_confirmation_no;
-                            $newLabel->content = $content;
-                            $newLabel->image = $image;
+                            $newLabel->content = $content_for_model;
+                            $newLabel->image = empty($pieces) ? $image : '';
                             $newLabel->generated_labels = json_encode($generated_labels);
                             $newLabel->created_at = $current_datetime;
                             $newLabel->updated_at = $current_datetime;
                             $newLabel->save();
                         }
-
-                        $label_path = Storage::disk('local')->path($this->labels_dir . '/' . $image);
-                        if (file_exists($label_path)) {
-                            $labels[$shipment_id] = [ // Use shipment_id to avoid duplicates
-                                "file" => $label_path,
-                                "name" => $image
-                            ];
-                        }
+                        
+                        $this->fulfillOrderWithTracking($order_info['id']);
 
                         $bulk_response[] = [
                             'order_id' => $global_order_id,
