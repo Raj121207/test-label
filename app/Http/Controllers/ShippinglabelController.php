@@ -2189,42 +2189,16 @@ class ShippinglabelController extends Controller
             return response()->json(['error' => 'Failed to merge PDFs'], 500);
         }
 
-        // Create ZIP file containing the merged PDF
-        $zip = new ZipArchive();
-        $zipdir = Storage::disk('local')->path($this->zip_label_dir);
-
-        if (!file_exists($zipdir)) {
-            mkdir($zipdir, 0777, true);
+        // Return a single merged PDF for download (no ZIP)
+        // Clean up temporary component PDFs but keep the merged file for download
+        foreach ($pdfFiles as $file) {
+            if (file_exists($file) && strpos($file, $temp_dir) !== false && $file !== $merged_pdf_path) {
+                @unlink($file);
+            }
         }
 
-        $filename = $zipdir . "/bulkdownloadlabels.zip";
-
-        if (file_exists($filename)) {
-            @unlink($filename);
-        }
-
-        if ($zip->open($filename, ZipArchive::CREATE)) {
-            if (file_exists($merged_pdf_path)) {
-                $zip->addFile($merged_pdf_path, "DHLBulkLabels.pdf");
-            }
-            $zip->close();
-
-            $downloadURL = asset('storage/app/' . $this->zip_label_dir . "/bulkdownloadlabels.zip");
-            
-            // Clean up temporary PDFs
-            foreach ($pdfFiles as $file) {
-                if (file_exists($file) && strpos($file, $temp_dir) !== false) {
-                    @unlink($file);
-                }
-            }
-            if (file_exists($merged_pdf_path)) {
-                @unlink($merged_pdf_path);
-            }
-
-            return response()->json(['downloadURL' => $downloadURL]);
-        }
-
-        return response()->json(['error' => 'Failed to create ZIP file'], 500);
+        $downloadURL = asset('storage/app/' . $this->shop_dir . "/temp_pdfs/DHLBulkLabels.pdf");
+        return response()->json(['downloadURL' => $downloadURL]);
     }
 
     public function printLabels(Request $request)
@@ -2377,9 +2351,11 @@ class ShippinglabelController extends Controller
             }
         }
 
+        $baseName = pathinfo($label['label'], PATHINFO_FILENAME);
+        $displayName = $baseName . '.pdf';
         return response()->file($label_path, [
             'Content-Type' => 'application/pdf',
-            'Content-Disposition' => 'inline; filename="' . $label['label'] . '.pdf"'
+            'Content-Disposition' => 'inline; filename="' . $displayName . '"'
         ]);
     }
 
@@ -2404,7 +2380,13 @@ class ShippinglabelController extends Controller
             return response()->json(['error' => 'Label file not found'], 404);
         }
 
-        return response()->download($label_path, $label['label']);
+        $downloadName = $label['label'];
+        // Ensure extension matches actual file for images converted to pdf earlier
+        $ext = strtolower(pathinfo($downloadName, PATHINFO_EXTENSION));
+        if ($ext !== strtolower(pathinfo($label_path, PATHINFO_EXTENSION))) {
+            $downloadName = pathinfo($downloadName, PATHINFO_FILENAME) . '.' . strtolower(pathinfo($label_path, PATHINFO_EXTENSION));
+        }
+        return response()->download($label_path, $downloadName);
     }
     
     public function bulkPrint(Request $request)
